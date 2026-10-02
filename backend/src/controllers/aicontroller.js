@@ -124,8 +124,148 @@ export const uploadResume = async (req, res) => {
     }
 }
 
-// function to create the resume 
+// function to create the resume
 // ... existing imports
+
+// Trims the resume we hand to the model. A large prompt is the main cost driver
+// for the slower reasoning models — we only need enough context to update, not a
+// byte-perfect copy of every field.
+const compactForPrompt = (resume) => {
+    // Clients send an explicit null for "no resume yet"; a default parameter
+    // only covers undefined, so normalise here.
+    resume = resume && typeof resume === "object" ? resume : {};
+
+    const clip = (value, max) =>
+        typeof value === "string" && value.length > max
+            ? `${value.slice(0, max).trimEnd()}…`
+            : value;
+
+    const compact = {};
+    const summary = resume.professional_summary || resume.professionalSummary;
+    if (summary) compact.professional_summary = clip(summary, 600);
+
+    if (resume.personal_info && Object.values(resume.personal_info).some(Boolean)) {
+        const { image, ...info } = resume.personal_info; // base64 blobs are huge and useless to the model
+        compact.personal_info = info;
+    }
+
+    if (Array.isArray(resume.skills) && resume.skills.length) {
+        compact.skills = resume.skills.slice(0, 30);
+    }
+
+    if (Array.isArray(resume.experience) && resume.experience.length) {
+        compact.experience = resume.experience.slice(0, 6).map((job) => ({
+            ...job,
+            description: clip(job.description, 500),
+        }));
+    }
+
+    if (Array.isArray(resume.education) && resume.education.length) {
+        compact.education = resume.education.slice(0, 4);
+    }
+
+    if (Array.isArray(resume.projects) && resume.projects.length) {
+        compact.projects = resume.projects.slice(0, 5).map((project) => ({
+            ...project,
+            description: clip(project.description, 400),
+        }));
+    }
+
+    return compact;
+};
+
+// Models occasionally wrap JSON in markdown fences or pad it with prose.
+// Pull out the outermost object instead of letting JSON.parse throw.
+const parseJsonLoose = (raw) => {
+    if (!raw || !raw.trim()) {
+        throw new Error("Model returned an empty response");
+    }
+    const cleaned = raw.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start === -1 || end <= start) {
+        throw new Error("Model response did not contain a JSON object");
+    }
+    return JSON.parse(cleaned.slice(start, end + 1));
+};
+
+// The resume schema, the context compaction and the request body are shared by
+// the buffered and the streaming path — keeping them here stops the two from
+// drifting apart.
+const buildChatRequest = (userMessage, currentResume) => {
+    // 1. Define the Resume Schema
+    const resumeSchema = `
+    {
+      "professional_summary": "string",
+      "skills": ["string"],
+      "personal_info": {
+         "full_name": "string", "profession": "string", "email": "string",
+         "linkedin": "string", "website": "string", "phone": "string", "location": "string"
+      },
+      "experience": [
+         { "company": "string", "position": "string", "description": "string", "start_date": "YYYY-MM", "end_date": "YYYY-MM", "is_current": boolean }
+      ],
+      "education": [
+         { "institute": "string", "degree": "string", "field": "string", "graduation_date": "YYYY", "gpa": "string" }
+      ],
+      "projects": [
+         { "name": "string", "description": "string", "type": "string" }
+      ]
+    }`;
+
+    // 2. Define the WRAPPER Schema (Critical Change)
+    // This allows the AI to choose between a 'chat' response or a 'resume' update
+    const context = compactForPrompt(currentResume);
+    const systemPrompt = `
+    You are an expert AI Resume Builder.
+
+    STRICT OUTPUT RULE: You must return a JSON object with this specific structure:
+    {
+        "responseType": "chat" | "resume_update",
+        "message": "string (The text reply to show the user)",
+        "resumeData": ${resumeSchema} (OR null if responseType is 'chat')
+    }
+
+    LOGIC RULES:
+    1. IF the user asks a general question (e.g., "Hello", "How are you", "What is your name", "What is the weather"):
+       - Set "responseType": "chat"
+       - Set "message": "I am a Resume Builder AI, I can help you create and optimize your resume. Please ask me to create or update your resume with specific details."
+       - Set "resumeData": null
+
+    2. IF the user provides resume details or asks to create/update:
+       - Set "responseType": "resume_update"
+       - Set "message": "I have updated your resume based on your request."
+       - Set "resumeData": (The fully populated resume JSON object).
+
+    CONTEXT:
+    ${Object.keys(context).length ? `CURRENT RESUME DATA: ${JSON.stringify(context)}` : "NO EXISTING RESUME. CREATE NEW."}
+
+    USER INPUT: "${userMessage}"
+    `;
+
+    return {
+        model: process.env.GROQ_MODEL,
+        messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userMessage }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.5,
+        max_tokens: 4096,
+    };
+};
+
+// Reasoning models spend most of their time on a hidden reasoning trace.
+// "low" keeps the writing quality while cutting the wait.
+const withReasoningEffort = (request) => {
+    try {
+        return ai.chat.completions.create({ ...request, reasoning_effort: "low" });
+    } catch (error) {
+        // Deployments that don't accept reasoning_effort reject with 400.
+        if (error?.status !== 400) throw error;
+        return ai.chat.completions.create(request);
+    }
+};
 
 // Controller to Generate Full Resume from Chat
 export const generateResumeFromChat = async (req, res) => {
@@ -136,67 +276,20 @@ export const generateResumeFromChat = async (req, res) => {
             return res.status(400).json({ message: "Message is required" });
         }
 
-        // 1. Define the Resume Schema (same as before)
-        const resumeSchema = `
-        {
-          "professional_summary": "string",
-          "skills": ["string"],
-          "personal_info": {
-             "full_name": "string", "profession": "string", "email": "string", 
-             "linkedin": "string", "website": "string", "phone": "string", "location": "string"
-          },
-          "experience": [
-             { "company": "string", "position": "string", "description": "string", "start_date": "YYYY-MM", "end_date": "YYYY-MM", "is_current": boolean }
-          ],
-          "education": [
-             { "institute": "string", "degree": "string", "field": "string", "graduation_date": "YYYY", "gpa": "string" }
-          ],
-          "projects": [
-             { "name": "string", "description": "string", "type": "string" }
-          ]
-        }`;
+        const startedAt = Date.now();
+        const response = await withReasoningEffort(buildChatRequest(userMessage, currentResume));
 
-        // 2. Define the WRAPPER Schema (Critical Change)
-        // This allows the AI to choose between a 'chat' response or a 'resume' update
-        const systemPrompt = `
-        You are an expert AI Resume Builder. 
-        
-        STRICT OUTPUT RULE: You must return a JSON object with this specific structure:
-        {
-            "responseType": "chat" | "resume_update",
-            "message": "string (The text reply to show the user)",
-            "resumeData": ${resumeSchema} (OR null if responseType is 'chat')
+        const choice = response.choices?.[0];
+
+        if (choice?.finish_reason === "length") {
+            return res.status(502).json({
+                message: "AI Generation Incomplete",
+                details: "The model ran out of tokens before finishing the resume. Try again with less detail.",
+            });
         }
 
-        LOGIC RULES:
-        1. IF the user asks a general question (e.g., "Hello", "How are you", "What is your name", "What is the weather"):
-           - Set "responseType": "chat"
-           - Set "message": "I am a Resume Builder AI, I can help you create and optimize your resume. Please ask me to create or update your resume with specific details."
-           - Set "resumeData": null
-
-        2. IF the user provides resume details or asks to create/update:
-           - Set "responseType": "resume_update"
-           - Set "message": "I have updated your resume based on your request."
-           - Set "resumeData": (The fully populated resume JSON object).
-
-        CONTEXT:
-        ${currentResume ? `CURRENT RESUME DATA: ${JSON.stringify(currentResume)}` : "NO EXISTING RESUME. CREATE NEW."}
-        
-        USER INPUT: "${userMessage}"
-        `;
-
-        const response = await ai.chat.completions.create({
-            model: process.env.GROQ_MODEL,
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userMessage }
-            ],
-            response_format: { type: "json_object" }, 
-            temperature: 0.5,
-        });
-
-        const content = response.choices[0].message.content;
-        const generatedData = JSON.parse(content);
+        const generatedData = parseJsonLoose(choice?.message?.content);
+        console.log(`AI resume generation took ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 
         // Return the whole wrapped object
         return res.status(200).json({ success: true, data: generatedData });
@@ -204,6 +297,127 @@ export const generateResumeFromChat = async (req, res) => {
     } catch (error) {
         console.error("AI Generation Error:", error);
         return res.status(500).json({ message: "AI Generation Failed", details: error.message });
+    }
+};
+
+// ── Server-Sent Events plumbing ────────────────────────────────────────────
+// A full resume generation routinely takes 30-60s. Over a plain JSON response
+// that is 30-60s of a frozen spinner with no idea whether it is working or hung.
+// Streaming the model's own reasoning trace back over SSE gives the client real
+// feedback instead of a guessing animation.
+const SSE_HEADERS = {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    // Stops nginx and similar proxies from buffering the whole response until
+    // it closes — which would defeat the point of streaming.
+    "X-Accel-Buffering": "no",
+};
+
+const sendEvent = (res, event, data) => {
+    if (res.writableEnded) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+};
+
+// Hard ceiling so a stuck upstream can't hold the socket open indefinitely.
+const STREAM_TIMEOUT_MS = 120_000;
+
+// Controller to Generate Full Resume from Chat (streaming, SSE)
+export const generateResumeFromChatStream = async (req, res) => {
+    const { userMessage, currentResume } = req.body;
+
+    if (!userMessage) {
+        return res.status(400).json({ message: "Message is required" });
+    }
+
+    res.writeHead(200, SSE_HEADERS);
+    res.flushHeaders?.();
+    sendEvent(res, "start", { model: process.env.GROQ_MODEL });
+
+    // Idle proxies and load balancers cut connections they consider dead.
+    const heartbeat = setInterval(() => {
+        if (!res.writableEnded) res.write(": ping\n\n");
+    }, 15_000);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), STREAM_TIMEOUT_MS);
+
+    // If the user closes the chat or navigates away, stop paying for tokens.
+    // Listen on `res`, not `req`: express.json() fully drains the request
+    // stream, so `req`'s "close" fires immediately and would abort every call.
+    const onClientGone = () => controller.abort();
+    res.on("close", onClientGone);
+
+    const cleanup = () => {
+        clearInterval(heartbeat);
+        clearTimeout(timeout);
+        res.off("close", onClientGone);
+    };
+
+    try {
+        const request = buildChatRequest(userMessage, currentResume);
+        const startedAt = Date.now();
+
+        // A 400 from an unsupported reasoning_effort surfaces before any chunk
+        // is written, so retrying here is safe for the client.
+        let stream;
+        try {
+            stream = await ai.chat.completions.create(
+                { ...request, reasoning_effort: "low", stream: true },
+                { signal: controller.signal }
+            );
+        } catch (error) {
+            if (error?.status !== 400) throw error;
+            stream = await ai.chat.completions.create(
+                { ...request, stream: true },
+                { signal: controller.signal }
+            );
+        }
+
+        let content = "";
+        let finishReason = null;
+
+        for await (const chunk of stream) {
+            const delta = chunk.choices?.[0]?.delta;
+            if (delta) {
+                // Groq surfaces gpt-oss reasoning as `reasoning`; other
+                // OpenAI-compatible deployments use `reasoning_content`.
+                const thought = delta.reasoning || delta.reasoning_content;
+                if (thought) sendEvent(res, "reasoning", { delta: thought });
+                if (delta.content) content += delta.content;
+            }
+            if (chunk.choices?.[0]?.finish_reason) {
+                finishReason = chunk.choices[0].finish_reason;
+            }
+        }
+
+        console.log(`AI resume generation (stream) took ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+
+        if (finishReason === "length") {
+            sendEvent(res, "error", {
+                message: "AI Generation Incomplete",
+                details: "The model ran out of tokens before finishing the resume. Try again with less detail.",
+            });
+        } else {
+            sendEvent(res, "result", { data: parseJsonLoose(content) });
+        }
+
+        sendEvent(res, "done", {});
+        return res.end();
+    } catch (error) {
+        // The OpenAI SDK reports an aborted request as APIUserAbortError rather
+        // than a DOM AbortError, so match both.
+        const aborted = error?.name === "AbortError" || error?.name === "APIUserAbortError";
+        if (aborted) {
+            if (!res.writableEnded) sendEvent(res, "error", { message: "Resume generation timed out. Please try again." });
+            return res.end();
+        }
+
+        console.error("AI Generation Stream Error:", error);
+        sendEvent(res, "error", { message: "AI Generation Failed", details: error.message });
+        return res.end();
+    } finally {
+        cleanup();
     }
 };
 
