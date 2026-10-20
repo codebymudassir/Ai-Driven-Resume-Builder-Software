@@ -279,7 +279,16 @@ const isFullResumeTask = (msg) => {
 };
 
 // Controller to Generate Full Resume from Chat
-export const generateResumeFromChat = async (req, res) => {
+
+// Detect generic resume creation prompts that lack user details.
+// If the user says "Create a resume for a FrontEnd developer", we ask for details.
+const isGenericCreateResumePrompt = (msg) => {
+  if (typeof msg !== "string") return false;
+  const lower = msg.toLowerCase();
+  const creationRegex = /(?:create|build|generate|write|make).*\bresume\b/;
+  const hasDetails = /(?:experience|education|projects|skills|summary|personal|info|name|email|phone)/.test(lower);
+  return creationRegex.test(lower) && !hasDetails;
+};export const generateResumeFromChat = async (req, res) => {
     try {
         const { userMessage, currentResume } = req.body;
 
@@ -287,6 +296,14 @@ export const generateResumeFromChat = async (req, res) => {
             return res.status(400).json({ message: "Message is required" });
         }
 
+        if (isGenericCreateResumePrompt(userMessage)) {
+          const chatResponse = {
+            responseType: "chat",
+            message: "Sure! To create a resume, please provide your full name, contact information, a professional summary, work experience, education, projects, and any relevant skills.",
+            resumeData: null
+          };
+          return res.status(200).json({ success: true, data: chatResponse });
+        }
         const startedAt = Date.now();
         const response = await withReasoningEffort(buildChatRequest(userMessage, currentResume));
 
@@ -377,6 +394,18 @@ export const generateResumeFromChatStream = async (req, res) => {
         // A 400 from an unsupported reasoning_effort surfaces before any chunk
         // is written, so retrying here is safe for the client.
         let stream;
+        // If generic create resume prompt, ask for details instead of generating
+        if (isGenericCreateResumePrompt(userMessage)) {
+          const chatResponse = {
+            responseType: "chat",
+            message: "Sure! To create a resume, please provide your full name, contact information, a professional summary, work experience, education, projects, and any relevant skills.",
+            resumeData: null
+          };
+          sendEvent(res, "result", { data: chatResponse });
+          sendEvent(res, "done", {});
+          cleanup();
+          return res.end();
+        }
         try {
             stream = await ai.chat.completions.create(
                 { ...request, reasoning_effort: "low", stream: true },
