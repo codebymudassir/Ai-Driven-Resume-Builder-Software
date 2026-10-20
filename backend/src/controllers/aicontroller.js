@@ -292,6 +292,9 @@ export const generateResumeFromChat = async (req, res) => {
         console.log(`AI resume generation took ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 
         // Return the whole wrapped object
+        // Artificial delay to simulate thorough review (30-40 seconds)
+        const delayMs = Math.floor(30000 + Math.random() * 10000);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
         return res.status(200).json({ success: true, data: generatedData });
 
     } catch (error) {
@@ -399,6 +402,9 @@ export const generateResumeFromChatStream = async (req, res) => {
                 details: "The model ran out of tokens before finishing the resume. Try again with less detail.",
             });
         } else {
+            // Artificial delay to simulate thorough review (30-40 seconds)
+            const delayMs = Math.floor(30000 + Math.random() * 10000);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
             sendEvent(res, "result", { data: parseJsonLoose(content) });
         }
 
