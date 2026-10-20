@@ -280,15 +280,71 @@ const isFullResumeTask = (msg) => {
 
 // Controller to Generate Full Resume from Chat
 
-// Detect generic resume creation prompts that lack user details.
-// If the user says "Create a resume for a FrontEnd developer", we ask for details.
+/**
+ * Detect generic resume creation prompts that lack user details.
+ * If the user says "Create a resume for a FrontEnd developer", we ask for details.
+ */
 const isGenericCreateResumePrompt = (msg) => {
   if (typeof msg !== "string") return false;
   const lower = msg.toLowerCase();
   const creationRegex = /(?:create|build|generate|write|make).*\bresume\b/;
   const hasDetails = /(?:experience|education|projects|skills|summary|personal|info|name|email|phone)/.test(lower);
   return creationRegex.test(lower) && !hasDetails;
-};export const generateResumeFromChat = async (req, res) => {
+};
+
+/**
+ * Extract partial resume information from a user message.
+ * Returns an object like {type: 'name', value: 'Mudassir'} or null.
+ */
+const extractPartialInfo = (msg) => {
+  if (typeof msg !== "string") return null;
+  const lower = msg.toLowerCase();
+  // Name
+  const nameMatch = msg.match(/my name is\s+([a-zA-Z]+\s+[a-zA-Z]+)/i);
+  if (nameMatch) return { type: "name", value: nameMatch[1].trim() };
+  // Email
+  const emailMatch = msg.match(/my email (?:is|:)?\s*([\w.%+-]+@[\w.-]+\.[a-zA-Z]{2,})/i);
+  if (emailMatch) return { type: "email", value: emailMatch[1].trim() };
+  // Phone
+  const phoneMatch = msg.match(/my phone (?:is|:)?\s*([\d\+\-\s\(\)]+)/i);
+  if (phoneMatch) return { type: "phone", value: phoneMatch[1].trim() };
+  // Professional summary (allow multi-sentence up to line end)
+  const summaryMatch = msg.match(/(?:my )?professional summary (?:is|:)?\s*(.+)/i);
+  if (summaryMatch) return { type: "summary", value: summaryMatch[1].trim() };
+  // Fallback: check for "summary" keyword without explicit marker
+  const genericSummaryMatch = msg.match(/summary (?:is|:)?\s*(.+)/i);
+  if (genericSummaryMatch) return { type: "summary", value: genericSummaryMatch[1].trim() };
+  return null;
+};
+
+/**
+ * Merge a partial piece of information into an existing resume object.
+ * Returns a new resume object (shallow clone).
+ */
+const mergePartial = (current, info) => {
+  const resume = current && typeof current === "object" ? { ...current } : {};
+  // Ensure personal_info exists
+  if (!resume.personal_info) resume.personal_info = {};
+  switch (info.type) {
+    case "name":
+      resume.personal_info.full_name = info.value;
+      break;
+    case "email":
+      resume.personal_info.email = info.value;
+      break;
+    case "phone":
+      resume.personal_info.phone = info.value;
+      break;
+    case "summary":
+      resume.professional_summary = info.value;
+      break;
+    default:
+      // ignore unknown types
+      break;
+  }
+  return resume;
+};
+export const generateResumeFromChat = async (req, res) => {
     try {
         const { userMessage, currentResume } = req.body;
 
@@ -304,6 +360,27 @@ const isGenericCreateResumePrompt = (msg) => {
           };
           return res.status(200).json({ success: true, data: chatResponse });
         }
+        // Detect partial info updates (name, email, phone, summary)
+        const partialInfo = extractPartialInfo(userMessage);
+        if (partialInfo) {
+          // Determine delay based on field type
+          let delayMs = 3000; // default short delay
+          if (["name", "email", "phone"].includes(partialInfo.type)) {
+            delayMs = 2000; // 2 seconds for simple fields
+          } else if (partialInfo.type === "summary") {
+            delayMs = Math.floor(5000 + Math.random() * 5000); // 5‑10 seconds for summary
+          }
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+
+          const updatedResume = mergePartial(currentResume, partialInfo);
+          const chatResponse = {
+            responseType: "resume_update",
+            message: `Added ${partialInfo.type} to your resume.`,
+            resumeData: updatedResume,
+          };
+          return res.status(200).json({ success: true, data: chatResponse });
+        }
+
         const startedAt = Date.now();
         const response = await withReasoningEffort(buildChatRequest(userMessage, currentResume));
 
@@ -400,6 +477,29 @@ export const generateResumeFromChatStream = async (req, res) => {
             responseType: "chat",
             message: "Sure! To create a resume, please provide your full name, contact information, a professional summary, work experience, education, projects, and any relevant skills.",
             resumeData: null
+          };
+          sendEvent(res, "result", { data: chatResponse });
+          sendEvent(res, "done", {});
+          cleanup();
+          return res.end();
+        }
+        // Detect partial info updates (name, email, phone, summary)
+        const partialInfo = extractPartialInfo(userMessage);
+        if (partialInfo) {
+          // Determine delay based on field type
+          let delayMs = 3000; // default short delay
+          if (["name", "email", "phone"].includes(partialInfo.type)) {
+            delayMs = 2000; // 2 seconds for simple fields
+          } else if (partialInfo.type === "summary") {
+            delayMs = Math.floor(5000 + Math.random() * 5000); // 5‑10 seconds for summary
+          }
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+
+          const updatedResume = mergePartial(currentResume, partialInfo);
+          const chatResponse = {
+            responseType: "resume_update",
+            message: `Added ${partialInfo.type} to your resume.`,
+            resumeData: updatedResume,
           };
           sendEvent(res, "result", { data: chatResponse });
           sendEvent(res, "done", {});
